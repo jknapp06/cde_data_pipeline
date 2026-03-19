@@ -1,0 +1,26 @@
+# ---- Data & Cache (DO NOT TRACK) ----
+data/
+cde_pins/
+*.csv
+*.xlsx
+*.txt
+*.zip
+*.parquet
+*.rds
+
+# ---- R & Workspace History ----
+.RData
+.Rhistory
+.Ruserdata
+.Rproj.user/
+.Rapp.history
+
+# ---- Positron & VS Code ----
+.vscode/
+.positron/
+
+# ---- renv (Let renv manage itself, but ignore libraries) ----
+renv/library/
+renv/local/
+renv/staging/
+renv/python/
