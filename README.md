@@ -26,6 +26,7 @@ This script executes 11 self-contained modules in sequence, ensuring that founda
 | `solano_dashboard_essa` | Solano Dashboard + ESSA | Includes Differentiated Assistance and ESSA eligibility flags. |
 | `ca_teacher_assignments` | Statewide Teacher Assignments | Cleaned credentialing and assignment data. |
 | `solano_teacher_assignments`| Solano Teacher Assignments | Filtered for Solano LEAs. |
+| `solano_academic_growth` | Solano Growth Model Data | Performance categories for growth levels by student group. |
 
 ### `02_process_caaspp.R`
 | Pin Name | Description | Key Features |

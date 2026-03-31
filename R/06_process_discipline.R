@@ -16,19 +16,21 @@ source(here("R", "clean.R"))
 # 2. Connect to the local Pins board
 local_board <- board_folder(here("data", "pins"))
 
+# Enforce character type for safe joining downstream
 scoe_schools <- pin_read(local_board, "solano_schools_directory") |>
-  select(school_code, scoe_reporting_district, scoe_reporting_school)
+  select(school_code, scoe_reporting_district, scoe_reporting_school) |>
+  mutate(school_code = as.character(school_code))
 
 # 3. Process Discipline Data -------------------------------------------------
 message("Processing Suspension data...")
 
 discipline_data <- map_dfr(suspend_urls, \(url) {
-  load_txt_from_cache(url, delim = "\t")
+  load_txt_from_cache(url, delim = "\t") |>
+    # Standardize names and types BEFORE binding rows to prevent map_dfr schema crashes
+    normalize_cde_names(data_term = "spring")
 }) |>
   filter(county_name == "Solano") |>
   mutate(
-    school_code = as.character(school_code),
-    year = parse_number(substr(academic_year, 1, 4)),
     student_group = case_when(
       startsWith(reporting_category, "R") ~ "Race/Ethnicity",
       startsWith(reporting_category, "G") ~ "Gender",

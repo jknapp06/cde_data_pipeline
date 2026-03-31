@@ -15,6 +15,7 @@ source(here("R", "clean.R"))
 # 2. Connect to the local Pins board
 local_board <- board_folder(here("data", "pins"))
 
+# Enforce character type for safe joining downstream
 scoe_schools <- pin_read(local_board, "solano_schools_directory") |>
   select(school_code, scoe_reporting_district, scoe_reporting_school) |>
   mutate(school_code = as.character(school_code))
@@ -26,10 +27,8 @@ message("Processing FRPM data...")
 ca_frpm <- imap_dfr(frpm_urls, \(url, year) {
   # Using our caching helper. start_row = 2 replaces rio's skip = 1
   df <- load_excel_from_cache(url, sheet = 2, start_row = 2) |>
-    mutate(
-      year = as.numeric(year),
-      school_code = as.character(school_code)
-    )
+    mutate(reporting_year = year) |> # Inject year for the normalizer
+    normalize_cde_names(data_term = "fall") # FRPM is Fall Census data
 
   # Conditionally filter CALPADS certification if the column exists (2021+)
   if ("calpads_fall_1_certification_status" %in% names(df)) {

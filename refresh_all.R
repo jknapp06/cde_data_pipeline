@@ -16,5 +16,7 @@ source(here("R", "05_process_attendance.R"))
 source(here("R", "06_process_discipline.R"))
 source(here("R", "07_process_frpm.R"))
 source(here("R", "08_process_el.R"))
+source(here("R", "09_process_homeless.R"))
+source(here("R", "10_process_upc.R"))
 
 message("Pipeline refresh complete!")

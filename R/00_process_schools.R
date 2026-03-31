@@ -25,52 +25,31 @@ temp_txt <- tempfile(fileext = ".txt")
 # Use our custom helper with the 5-minute timeout and retry logic
 safe_download_file(cde_directory_url, temp_txt)
 
-solano_schools <- vroom(
+ca_schools <- vroom(
   temp_txt,
   delim = "\t",
   show_col_types = FALSE
 ) |>
-  clean_names() |>
-  filter(county == "Solano") |>
-  mutate(
-    # First, force the 14-digit code to be a character to keep leading zeros
-    cds_code = as.character(cds_code),
-
-    # Extract the codes using stringr::str_sub()
-    county_code = str_sub(cds_code, 1, 2),
-    district_code = str_sub(cds_code, 3, 7),
-    school_code = str_sub(cds_code, 8, 14),
-
-    # Apply standard naming rules to the raw CDE names immediately
-    district = smart_title_case(district),
-    school = smart_title_case(school)
-  ) |>
-  select(
-    # Now this select() will work because the columns exist!
-    county_code,
-    county,
-    district_code,
-    district,
-    school_code,
-    school,
-    status_type,
-    charter,
-    funding_type
-  )
+  # Add the current year so normalize_cde_names doesn't complain,
+  # and also to support matching when needed.
+  mutate(reporting_year = as.numeric(format(Sys.Date(), "%Y"))) |>
+  # Passes through our super-charged normalizer!
+  # This now standardizes names, extracts codes from CDS, and title-cases entity names.
+  normalize_cde_names()
 
 # 4. Apply SCOE Business Rules (Funding & Grouping) --------------------------
 message("Applying SCOE Charter Reporting Rules...")
 
-scoe_directory <- solano_schools |>
+ca_directory <- ca_schools |>
   mutate(
     # SCOE DISTRICT REPORTING RULES
     scoe_reporting_district = case_when(
-      charter == "Y" & funding_type == "Directly funded" ~ school,
-      TRUE ~ district
+      charter == "Y" & funding_type == "Directly funded" ~ school_name,
+      TRUE ~ district_name
     ),
 
     # SCOE SCHOOL REPORTING RULES
-    scoe_reporting_school = school
+    scoe_reporting_school = school_name
   )
 
 # 5. Pin the Master Directory ------------------------------------------------
@@ -78,10 +57,10 @@ message("Pinning SCOE Master Directory...")
 
 pin_write(
   board = local_board,
-  x = scoe_directory,
-  name = "solano_schools_directory",
+  x = ca_directory,
+  name = "ca_schools_directory",
   type = "parquet",
-  description = "Master lookup table for Solano schools. Includes SCOE charter funding rules and name casing."
+  description = "Master lookup table for CA schools. Includes SCOE charter funding rules and canonical snake_case names."
 )
 
 message("School directory successfully pinned! Ready for use.")

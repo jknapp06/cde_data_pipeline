@@ -16,8 +16,10 @@ source(here("R", "clean.R"))
 # 2. Connect to the local Pins board
 local_board <- board_folder(here("data", "pins"))
 
+# Added a quick as.character() coercion to match your normalizer's output types
 scoe_schools <- pin_read(local_board, "solano_schools_directory") |>
-  select(school_code, scoe_reporting_district, scoe_reporting_school)
+  select(school_code, scoe_reporting_district, scoe_reporting_school) |>
+  mutate(school_code = as.character(school_code))
 
 # 3. Process Attendance Data -------------------------------------------------
 message("Processing Chronic Absenteeism data...")
@@ -28,12 +30,12 @@ attendance_data <- map_dfr(absent_urls, \(url) {
     mutate(across(
       .cols = starts_with("chronic") & where(is.character),
       .fns = parse_number
-    ))
+    )) |>
+    # Standardize names and types BEFORE binding rows to prevent map_dfr schema crashes
+    normalize_cde_names(data_term = "spring")
 }) |>
   filter(county_name == "Solano") |>
   mutate(
-    school_code = as.character(school_code),
-    year = parse_number(substr(academic_year, 1, 4)),
     student_group = case_when(
       startsWith(reporting_category, "R") ~ "Race/Ethnicity",
       startsWith(reporting_category, "GR") ~ "Grade",

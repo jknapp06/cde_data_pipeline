@@ -17,46 +17,30 @@ local_board <- board_folder(here("data", "pins"))
 
 # 3. Read Dashboard Indicator Files -------------------------------------------
 message("Loading dashboard indicator files...")
-dashboard_raw <- download_and_load_dashboard_set(dashboard_files)
+dashboard_raw <- download_and_load_dashboard_set(dashboard_files) |>
+  normalize_cde_names()
 
-# Set all school names to current names from latest year
-max_year <- max(dashboard_raw$reportingyear, na.rm = TRUE)
-
+# Get the most recent name for *every* CDS code, even if they closed before max_year
 current_names_codes <- dashboard_raw |>
-  filter(reportingyear == max_year) |>
-  select(cds, countyname, districtname, schoolname) |>
-  distinct()
+  arrange(desc(reporting_year)) |>
+  select(cds, county_name, district_name, school_name) |>
+  distinct(cds, .keep_all = TRUE)
 
 dashboard_raw <- dashboard_raw |>
-  select(-countyname, -districtname, -schoolname) |>
+  select(-county_name, -district_name, -school_name) |>
   left_join(current_names_codes, by = "cds")
 
 # 4. Read & Normalize Assistance Files ----------------------------------------
 message("Loading assistance files...")
 
-# Define the exact parameters for each file
-assistance_meta <- tribble(
-  ~name                   , ~url                                  , ~sheet , ~start_row ,
-  "assistance_25"         , assistance_urls$assistance_25         ,      4 ,          6 ,
-  "assistance_25_charter" , assistance_urls$assistance_25_charter ,      4 ,          6 ,
-  "assistance_24"         , assistance_urls$assistance_24         ,      4 ,          6 ,
-  "assistance_24_charter" , assistance_urls$assistance_24_charter ,      4 ,          6 ,
-  "assistance_23"         , assistance_urls$assistance_23         ,      4 ,          6 ,
-  "assistance_23_charter" , assistance_urls$assistance_23_charter ,      4 ,          6 ,
-  "assistance_22"         , assistance_urls$assistance_22         ,      4 ,          6 ,
-  "assistance_19"         , assistance_urls$assistance_19         ,      4 ,          6 ,
-  "assistance_18"         , assistance_urls$assistance_18         ,      1 ,          5 ,
-  "assistance_17"         , assistance_urls$assistance_17         ,      4 ,          5
-)
-
-# Use pmap to iterate over the table and load the files
+# Use pmap to iterate over the assistance_files table from data-urls.R
 raw_assistance_list <- pmap(
-  assistance_meta,
+  assistance_files,
   function(name, url, sheet, start_row) {
     load_excel_from_cache(url, sheet = sheet, start_row = start_row)
   }
 ) |>
-  set_names(assistance_meta$name)
+  set_names(assistance_files$name)
 
 message("Normalizing assistance data...")
 assistance <- normalize_assistance(raw_assistance_list)
@@ -65,17 +49,8 @@ assistance <- normalize_assistance(raw_assistance_list)
 # 5. Read & Normalize ESSA Files ----------------------------------------------
 message("Loading ESSA files...")
 
-essa_meta <- tribble(
-  ~name    , ~url             , ~sheet , ~start_row ,
-  "essa25" , essa_urls$essa25 ,      2 ,          3 ,
-  "essa24" , essa_urls$essa24 ,      2 ,          3 ,
-  "essa23" , essa_urls$essa23 ,      2 ,          3 ,
-  "essa22" , essa_urls$essa22 ,      2 ,          3 ,
-  "essa21" , essa_urls$essa21 ,      1 ,          3 ,
-  "essa19" , essa_urls$essa19 ,      1 ,          3
-)
-
-raw_essa_list <- pmap(essa_meta, function(name, url, sheet, start_row) {
+# Use pmap to iterate over the essa_files table from data-urls.R
+raw_essa_list <- pmap(essa_files, function(name, url, sheet, start_row) {
   # 1. Load the raw excel file
   df <- load_excel_from_cache(url, sheet = sheet, start_row = start_row)
 
@@ -105,7 +80,7 @@ raw_essa_list <- pmap(essa_meta, function(name, url, sheet, start_row) {
       .fns = ~ suppressWarnings(as.numeric(.x))
     ))
 }) |>
-  set_names(essa_meta$name)
+  set_names(essa_files$name)
 
 essa <- normalize_essa(raw_essa_list)
 
@@ -113,15 +88,14 @@ essa <- normalize_essa(raw_essa_list)
 message("Merging dashboard with assistance and computing eligibility...")
 
 dashboard_clean <- dashboard_raw |>
-  rename_with(~ str_to_lower(.x)) |>
   mutate(
-    studentgroup = if_else(
-      is.na(studentgroup) & indicator == "ELPI",
+    student_group = if_else(
+      is.na(student_group) & indicator == "ELPI",
       "EL",
-      studentgroup
+      student_group
     ),
-    student_group_long = case_match(
-      studentgroup,
+    student_group_long = recode_values(
+      student_group,
       "ALL" ~ "All students",
       "AA" ~ "Black/African American",
       "AI" ~ "American Indian or Alaska Native",
@@ -143,16 +117,16 @@ dashboard_clean <- dashboard_raw |>
       "HOM" ~ "Homeless Youth",
       "TOM" ~ "Multiple Races/Two or more",
       "LTEL" ~ "Long-Term English Learner",
-      .default = studentgroup
+      default = student_group
     ),
-    countyname = case_match(
+    county_name = recode_values(
       rtype,
       "X" ~ "CA State Aggregate",
-      .default = countyname
+      default = county_name
     ),
-    schoolname = case_when(
-      rtype == "D" & is.na(schoolname) ~ "District Aggregate",
-      TRUE ~ schoolname
+    school_name = case_when(
+      rtype == "D" & is.na(school_name) ~ "District Aggregate",
+      TRUE ~ school_name
     )
   )
 
@@ -162,17 +136,19 @@ check_priorities <- function(priority, priorities) {
 
 dashboard_with_assistance <- dashboard_clean |>
   left_join(
-    assistance,
-    by = join_by(cds, studentgroup, reportingyear, charter_flag)
+    # Drop the redundant columns generated by normalize_cde_names before joining
+    assistance |>
+      select(-c(academic_year, county_code, district_code, school_code)),
+    by = join_by(cds, student_group, reporting_year, charter_flag)
   ) |>
   left_join(
     priority_eligibility_lookup,
-    by = join_by("assistance_current" == "assistance")
+    by = join_by(assistance_current == assistance)
   ) |>
   rename(priorities_current = priorities) |>
   left_join(
     priority_eligibility_lookup,
-    by = join_by("assistance_prior" == "assistance")
+    by = join_by(assistance_prior == assistance)
   ) |>
   rename(priorities_prior = priorities) |>
   left_join(priority_eligibility_lookup, by = "assistance")
@@ -194,7 +170,7 @@ priority_4_tbl <- compute_priority4_summary(dashboard_with_elibibility)
 ca_dashboard <- dashboard_with_elibibility |>
   left_join(
     priority_4_tbl,
-    by = join_by(cds, reportingyear, student_group_long)
+    by = join_by(cds, reporting_year, student_group_long)
   ) |>
   mutate(
     indicator_eligible = case_when(
@@ -202,13 +178,13 @@ ca_dashboard <- dashboard_with_elibibility |>
       priority != 4 & priority_eligible & color == "1" ~ TRUE,
       priority != 4 &
         priority_eligible &
-        reportingyear == 2022 &
+        reporting_year == 2022 &
         statuslevel == 1 ~ TRUE,
-      studentgroup != "LTEL" &
+      student_group != "LTEL" &
         priority == 4 &
         indicator == "ELA" &
         caaspp_eligible == TRUE ~ TRUE,
-      studentgroup != "LTEL" &
+      student_group != "LTEL" &
         priority == 4 &
         indicator == "Math" &
         caaspp_eligible == TRUE ~ TRUE,
@@ -216,37 +192,54 @@ ca_dashboard <- dashboard_with_elibibility |>
       TRUE ~ FALSE
     )
   ) |>
-  select(-c(ELA, Math, ELPI, caaspp_eligible, elpi_eligible))
+  # UPDATE THIS LINE: Use any_of() to cleanly drop all pivoted Priority 4 columns
+  select(-any_of(c("ELA", "Math", "ELPI", "science", "growth", "caaspp_eligible", "elpi_eligible")))
 
 small_dashboard <- ca_dashboard |>
-  filter(countyname %in% c("Solano", "CA State Aggregate"))
+  filter(county_name %in% c("Solano", "CA State Aggregate"))
 
 # 7. Download & Clean Teacher Data --------------------------------------------
 message("Loading teacher credentialing data...")
 teacher_assignments <- load_txt_from_cache(teacher_assignments_url)
 teacher_assignments_clean <- normalize_teacher_assignments(teacher_assignments)
-solano_teachers <- teacher_assignments_clean |> filter(countyname == "Solano")
+solano_teachers <- teacher_assignments_clean |> filter(county_name == "Solano")
 
 # 8. Join with ESSA for local dashboard_essa ----------------------------------
 dashboard_essa <- ca_dashboard |>
-  filter(countyname == "Solano") |>
+  filter(county_name == "Solano") |>
   left_join(
     essa,
-    join_by(
+    # Drop the names from the join keys to prevent duplicate rows
+    # if a school changed its name between years in the ESSA file
+    by = join_by(
       cds,
-      districtname,
-      countyname,
-      schoolname,
-      studentgroup,
-      reportingyear
-    )
+      student_group,
+      reporting_year
+    ),
+    suffix = c("", "_essa") # In case ESSA brings its own name columns, don't break ours
   )
 
+# 8.5 Free up memory before pinning -------------------------------------------
+message("Cleaning up intermediate objects to free RAM...")
+
+# Remove massive intermediate dataframes that we no longer need
+rm(
+  dashboard_raw,
+  dashboard_clean,
+  dashboard_with_assistance,
+  dashboard_with_elibibility,
+  raw_assistance_list,
+  raw_essa_list,
+  assistance,
+  essa
+)
+
+# Force R to release the memory back to your operating system immediately
+gc()
 
 # 9. Pin to Local Board -------------------------------------------------------
-message("Pinning all datasets to the OneDrive board...")
+message("Pinning all datasets to the local board...")
 
-# Note: We use 'name' to identify the pin, and 'title'/'description' for metadata
 pin_write(
   local_board,
   ca_dashboard,
@@ -261,20 +254,7 @@ pin_write(
   type = "parquet",
   title = "Solano Dashboard"
 )
-pin_write(
-  local_board,
-  assistance,
-  name = "assistance_data",
-  type = "parquet",
-  title = "School Assistance Status"
-)
-pin_write(
-  local_board,
-  essa,
-  name = "essa_data",
-  type = "parquet",
-  title = "ESSA Data"
-)
+
 pin_write(
   local_board,
   dashboard_essa,
@@ -297,4 +277,61 @@ pin_write(
   title = "Solano Teacher Assignments"
 )
 
-message("Success! All dashboard data refreshed and pinned to OneDrive.")
+# Load the raw growth file
+growth_raw <- load_txt_from_cache(growth_url) |>
+  normalize_cde_names() |> 
+  rename(performance_category = performancecategory)
+
+# Keep it lean! Only select what you actually need
+solano_growth <- growth_raw |>
+  filter(county_name == "Solano") |>
+  mutate(
+    student_group_long = recode_values(
+      student_group,
+      "ALL" ~ "All students",
+      "AA" ~ "Black/African American",
+      "AI" ~ "American Indian or Alaska Native",
+      "AS" ~ "Asian",
+      "FI" ~ "Filipino",
+      "HI" ~ "Hispanic",
+      "PI" ~ "Pacific Islander",
+      "WH" ~ "White",
+      "MR" ~ "Multiple Races/Two or more",
+      "EL" ~ "English Learner",
+      "ELO" ~ "English Learners Only",
+      "RFP" ~ "RFEPs Only",
+      "EO" ~ "English Only",
+      "SBA" ~ "Smarter Balanced Assessment",
+      "CAA" ~ "CA Alternative Assessment",
+      "SED" ~ "Socioeconomically Disadvantaged",
+      "SWD" ~ "Students with Disabilities",
+      "FOS" ~ "Foster Youth",
+      "HOM" ~ "Homeless Youth",
+      "TOM" ~ "Multiple Races/Two or more",
+      "LTEL" ~ "Long-Term English Learner",
+      default = student_group
+    ),
+    # Map the performance categories using the exact layout from CDE
+    # Wrapping in as.character() just in case vroom guessed the column as numeric
+    performance_category_text = recode_values(
+      as.character(performance_category),
+      "1" ~ "Minimal Growth",
+      "2" ~ "Moderate Growth",
+      "3" ~ "Average Growth",
+      "4" ~ "Accelerated Growth",
+      "5" ~ "Exceptional Growth",
+      "0" ~ "No Performance Category",
+      default = NA_character_
+    )
+  )
+
+# Pin it!
+pin_write(
+  local_board,
+  solano_growth,
+  name = "solano_academic_growth",
+  type = "parquet",
+  title = "Solano Academic Growth"
+)
+
+message("Success! All dashboard data refreshed and pinned.")

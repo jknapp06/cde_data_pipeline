@@ -116,9 +116,10 @@ load_excel_from_cache <- function(
 load_zip_from_cache <- function(
   zip_url,
   file_name,
-  deliminator = "^",
+  delim = "^", # Changed from deliminator to standard delim
   force = FALSE,
-  col_names = TRUE
+  col_names = TRUE,
+  ... # Added ... to pass any other readr arguments through
 ) {
   dest_zip <- get_cached_file(zip_url, force = force)
   message(glue::glue("Reading {file_name} from {basename(dest_zip)}..."))
@@ -127,9 +128,10 @@ load_zip_from_cache <- function(
     {
       readr::read_delim(
         unz(dest_zip, file_name),
-        delim = deliminator,
+        delim = delim,
         col_names = col_names,
-        show_col_types = FALSE
+        show_col_types = FALSE,
+        ... # Passing extra args directly to read_delim
       ) |>
         janitor::clean_names()
     },
@@ -185,8 +187,8 @@ load_dashboard_file_from_cache <- function(local_path, d_indicator, priority) {
     clean_names() |>
     mutate(indicator = d_indicator, priority = priority) |>
     rename(
-      reportingyear = dplyr::any_of(c("reportingyear", "reporting_year")),
-      changelevel = dplyr::any_of(c("changelevel", "change_level"))
+      reporting_year = dplyr::any_of(c("reportingyear", "reporting_year")),
+      change_level = dplyr::any_of(c("changelevel", "change_level"))
     )
 }
 

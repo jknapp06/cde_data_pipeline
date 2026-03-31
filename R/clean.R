@@ -1,40 +1,197 @@
-# clean.R
-
 library(dplyr)
 library(stringr)
 library(tidyr)
+library(purrr)
+library(rlang)
+library(readr) # Ensure readr is loaded for parse_number()
 
-options(scipen = 999) # so CDS isn't changed in scientific notation
+options(scipen = 999) # Prevents CDS codes from converting to scientific notation
 
-# normalize_assistance_files: reads assistance_xlsx tibbles and maps to canonical column names
-# Input: named list of tibbles (raw reads). Output: single canonical assistance tibble.
-# some assistance files do no have a reportingyear column. For those, we need to add it based on the file source.
+# ==============================================================================
+# 1. UNIVERSAL CDE NORMALIZER
+# ==============================================================================
+# normalizes core CDE identifiers, safely generates CDS codes, and handles years.
+normalize_cde_names <- function(df, data_term = "spring") {
+  # --- CASE: BASELINE CLEANING ---
+  df_clean <- df |> janitor::clean_names()
+
+  df_renamed <- df_clean |>
+    rename(
+      cds = any_of(c("cds_code", "cdscode", "county_district_school_code")),
+      county_code = any_of(c("countycode", "county_cd")),
+      county_name = any_of(c("countyname", "county")),
+      district_code = any_of(c("districtcode", "district_cd")),
+      district_name = any_of(c("districtname", "district")),
+      school_code = any_of(c("schoolcode", "school_cd")),
+      school_name = any_of(c("schoolname", "school")),
+      academic_year = any_of(c("academicyear")),
+      reporting_year = any_of(c(
+        "reporting_year",
+        "reportingyear",
+        "year"
+      )),
+      student_group = any_of(c("studentgroup", "student_group")),
+      total_enrollment = any_of(c("totalenrollment", "total_enrollment")),
+      subgroup_total = any_of(c("subgrouptotal", "sub_group_total"))
+    )
+
+  # --- CASE: YEAR FORMAT STANDARDIZATION ---
+
+  # 1. Establish a canonical 4-digit reporting_year first
+  if (
+    "academic_year" %in% names(df_renamed) &&
+      !"reporting_year" %in% names(df_renamed)
+  ) {
+    if (data_term == "spring") {
+      df_renamed <- df_renamed |>
+        mutate(reporting_year = as.numeric(str_sub(academic_year, 1, 4)) + 1)
+    } else {
+      df_renamed <- df_renamed |>
+        mutate(reporting_year = as.numeric(str_sub(academic_year, 1, 4)))
+    }
+  } else if ("reporting_year" %in% names(df_renamed)) {
+    df_renamed <- df_renamed |>
+      mutate(reporting_year = as.numeric(reporting_year))
+  } else {
+    warning(
+      "Neither academic_year nor reporting_year found in data. You may need to add it manually."
+    )
+  }
+
+  # 2. Forcefully rebuild academic_year from scratch to guarantee "YYYY-YY" format
+  if ("reporting_year" %in% names(df_renamed)) {
+    if (data_term == "spring") {
+      df_renamed <- df_renamed |>
+        mutate(
+          academic_year = paste0(
+            reporting_year - 1,
+            "-",
+            str_sub(as.character(reporting_year), 3, 4)
+          )
+        )
+    } else {
+      df_renamed <- df_renamed |>
+        mutate(
+          academic_year = paste0(
+            reporting_year,
+            "-",
+            str_sub(as.character(reporting_year + 1), 3, 4)
+          )
+        )
+    }
+  }
+
+  # Enforce canonical data types before touching codes
+  df_renamed <- df_renamed |>
+    mutate(
+      across(
+        any_of(c(
+          "academic_year",
+          "cds",
+          "county_code",
+          "district_code",
+          "school_code"
+        )),
+        as.character
+      ),
+      # ADDED "test_year" to the numeric coercion list
+      across(any_of(c("reporting_year", "test_year")), as.numeric) 
+    )
+
+  # --- CASE: BI-DIRECTIONAL CDS HANDLING ---
+  # 1. Bottom-Up: Auto-complete missing CDS from sub-codes (e.g., Teacher Data)
+  if (
+    !"cds" %in% names(df_renamed) &&
+      "county_code" %in% names(df_renamed) &&
+      "district_code" %in% names(df_renamed)
+  ) {
+    df_renamed <- df_renamed |>
+      mutate(
+        cds = paste0(
+          str_pad(coalesce(as.character(county_code), "00"), 2, pad = "0"),
+          str_pad(coalesce(as.character(district_code), "00000"), 5, pad = "0"),
+          str_pad(coalesce(as.character(school_code), "0000000"), 7, pad = "0")
+        )
+      )
+  }
+
+  # 2. Top-Down: Extract missing sub-codes from CDS (e.g., Dashboard Data)
+  if ("cds" %in% names(df_renamed)) {
+    if (!"county_code" %in% names(df_renamed)) {
+      df_renamed$county_code <- NA_character_
+    }
+    if (!"district_code" %in% names(df_renamed)) {
+      df_renamed$district_code <- NA_character_
+    }
+    if (!"school_code" %in% names(df_renamed)) {
+      df_renamed$school_code <- NA_character_
+    }
+
+    df_renamed <- df_renamed |>
+      mutate(
+        county_code = coalesce(county_code, str_sub(cds, 1, 2)),
+        district_code = coalesce(district_code, str_sub(cds, 3, 7)),
+        school_code = coalesce(school_code, str_sub(cds, 8, 14))
+      )
+  }
+
+  # --- CASE: ENTITY NAME FORMATTING ---
+  name_cols <- intersect(
+    names(df_renamed),
+    c("county_name", "district_name", "school_name")
+  )
+  if (length(name_cols) > 0) {
+    df_renamed <- df_renamed |>
+      mutate(across(all_of(name_cols), smart_title_case))
+  }
+
+  # Ensure standalone code columns always retain leading zeros
+  # (Ignoring NAs so they don't become the string "NA")
+  df_renamed <- df_renamed |>
+    mutate(
+      county_code = if_else(
+        !is.na(county_code),
+        str_pad(county_code, 2, "left", "0"),
+        NA_character_
+      ),
+      district_code = if_else(
+        !is.na(district_code),
+        str_pad(district_code, 5, "left", "0"),
+        NA_character_
+      ),
+      school_code = if_else(
+        !is.na(school_code),
+        str_pad(school_code, 7, "left", "0"),
+        NA_character_
+      )
+    )
+
+  return(df_renamed)
+}
+
+
+# ==============================================================================
+# 2. SPECIFIC DATA NORMALIZERS
+# ==============================================================================
+
+# --- CASE: ASSISTANCE DATA ---
 normalize_assistance <- function(raw_list) {
-  # Validate input
   if (!is.list(raw_list)) {
     stop("Input must be a list of data frames")
   }
-
-  # Log the number of input files
   message("Normalizing assistance data from ", length(raw_list), " files")
 
-  # Helper function with more robust error handling
   process_assistance <- function(df, file_index) {
-    # Validate each input data frame
     if (!is.data.frame(df)) {
       warning("Item ", file_index, " is not a data frame. Skipping.")
       return(NULL)
     }
 
-    # Get column names
+    df <- df |> janitor::clean_names()
     df_names <- names(df)
-    # message(paste(df_names, collapse = ", "))
-
-    # More robust year detection with explicit checks
     assistance_year <- NA_integer_
     assistance_variable_name <- NA_character_
 
-    # Prioritized year detection
     year_checks <- list(
       "assistance_status2025" = 2025,
       "assistance_status2024" = 2024,
@@ -45,44 +202,29 @@ normalize_assistance <- function(raw_list) {
       "assistance_status" = 2017
     )
 
-    # Check if charter
-    charter <- "chartername" %in% df_names
+    charter <- any(c("chartername", "charter_name") %in% df_names)
 
     for (col_name in names(year_checks)) {
       if (col_name %in% df_names) {
         assistance_year <- year_checks[[col_name]]
-        assistance_variable_name <- if (assistance_year == 2017) {
-          "assistance_status"
-        } else {
+        assistance_variable_name <- if_else(
+          assistance_year == 2017,
+          "assistance_status",
           paste0("assistance_status", assistance_year)
-        }
+        )
         break
       }
     }
 
-    # Throw an error if no year could be detected
     if (is.na(assistance_year)) {
       stop("Could not determine assistance year for file ", file_index)
     }
 
-    # Detailed logging
-    message(
-      "Processing file ",
-      file_index,
-      ": Detected year ",
-      assistance_year,
-      ", Using variable ",
-      assistance_variable_name
-    )
-
-    # Attempt to process the file with error handling
     tryCatch(
       {
         slim_df <- df |>
-          # Add reportingyear and pick only the most recent assistance status column
           mutate(
-            reportingyear = assistance_year,
-            # Safely select the assistance status column
+            reporting_year = assistance_year,
             assistance_status = if (assistance_variable_name %in% names(df)) {
               .data[[assistance_variable_name]]
             } else {
@@ -90,11 +232,11 @@ normalize_assistance <- function(raw_list) {
             },
             charter_flag = if_else(charter, "Y", NA_character_)
           ) |>
-          # Keep key columns
+          rename(cds = any_of(c("cds", "cds_code", "cdscode"))) |>
           select(
             cds,
             charter_flag,
-            reportingyear,
+            reporting_year,
             assistance_status,
             ends_with("priorities"),
             ends_with("current"),
@@ -102,7 +244,6 @@ normalize_assistance <- function(raw_list) {
             starts_with("ec")
           )
 
-        # Define the base patterns for current and prior columns
         current_patterns <- c(
           "a_acurrent",
           "a_icurrent",
@@ -132,7 +273,6 @@ normalize_assistance <- function(raw_list) {
           "w_hprior"
         )
 
-        # For LTEL columns, only include them if they exist
         if ("lte_lcurrent" %in% names(slim_df)) {
           current_patterns <- c(current_patterns, "lte_lcurrent")
         }
@@ -140,24 +280,16 @@ normalize_assistance <- function(raw_list) {
           prior_patterns <- c(prior_patterns, "lte_lprior")
         }
 
-        # Combine the patterns for pivot_longer
         cols_to_pivot <- c(current_patterns, prior_patterns)
-        cols_to_pivot <- cols_to_pivot[cols_to_pivot %in% names(slim_df)] # Ensure only existing columns are included
+        cols_to_pivot <- cols_to_pivot[cols_to_pivot %in% names(slim_df)]
 
-        long_df <- tibble()
         if (charter) {
-          message(paste(
-            "Charter assistance file detected. Assistance year:",
-            assistance_year
-          ))
-          # message(paste(df_names, collapse = ", "))
-          long_df <-
-            slim_df |>
+          long_df <- slim_df |>
             pivot_longer(
-              cols = cols_to_pivot,
-              names_to = c("studentgroup", "current_prior"),
+              cols = all_of(cols_to_pivot),
+              names_to = c("student_group", "current_prior"),
               names_pattern = "(.+)(current|prior)",
-              values_to = "assistance",
+              values_to = "assistance"
             ) |>
             pivot_wider(
               names_from = current_prior,
@@ -165,27 +297,24 @@ normalize_assistance <- function(raw_list) {
               names_prefix = "assistance_"
             )
         } else {
-          long_df <-
-            slim_df |>
+          long_df <- slim_df |>
             pivot_longer(
               cols = ends_with("priorities"),
-              names_to = "studentgroup",
+              names_to = "student_group",
               values_to = "assistance",
               names_pattern = "(.*)priorities"
             )
         }
 
-        processed_df <-
-          long_df |>
+        processed_df <- long_df |>
           mutate(
-            studentgroup = if_else(
-              studentgroup == "tom",
+            student_group = if_else(
+              student_group == "tom",
               "MR",
-              str_to_upper(str_remove_all(studentgroup, "_"))
+              str_to_upper(str_remove_all(student_group, "_"))
             )
           )
 
-        # Validate key columns
         if (!"cds" %in% names(processed_df)) {
           warning("File ", file_index, " is missing 'cds' column")
         }
@@ -194,54 +323,27 @@ normalize_assistance <- function(raw_list) {
       },
       error = function(e) {
         warning("Error processing file ", file_index, ": ", e$message)
-        traceback()
         return(NULL)
       }
     )
   }
 
-  # Process all files, filtering out any NULL results
   processed_files <- keep(
     map2(raw_list, seq_along(raw_list), process_assistance),
     Negate(is.null)
   )
-
-  # Check if any files were successfully processed
   if (length(processed_files) == 0) {
     stop("No files could be processed")
   }
-  # Bind rows and perform final transformations
-  result <- bind_rows(processed_files)
 
-  # Check if result has charters
-  message(paste(
-    result |>
-      filter(charter_flag == "Y") |>
-      nrow(),
-    "rows where charter_flag is TRUE in processed_files."
-  ))
-
-  # Log final results
-  message(
-    "Normalized assistance data: ",
-    nrow(result),
-    " rows, ",
-    n_distinct(result$cds),
-    " unique CDSs"
-  )
-
+  result <- bind_rows(processed_files) |> normalize_cde_names()
   return(result)
 }
 
-
-# normalize_essa: canonicalize ESSA files, pivot and compute ATSI and CSI summaries
-# Input: list of raw essa tibbles (as returned by load_essa_xlsx)
+# --- CASE: ESSA DATA ---
 normalize_essa <- function(raw_list) {
-  # standardize names; then bind_rows and pivot longer for student groups
-  essa_all <- bind_rows(raw_list) |>
-    janitor::clean_names()
-
-  # parse numeric enrollment and student group columns if present
+  essa_all <- bind_rows(raw_list) |> normalize_cde_names()
+  status_cols <- grep("^assistance_status", names(essa_all), value = TRUE)
   grp_cols <- c(
     "aa",
     "ai",
@@ -257,91 +359,56 @@ normalize_essa <- function(raw_list) {
     "tom",
     "wh"
   )
-  grp_present <- intersect(names(essa_all), grp_cols)
 
-  # if (length(grp_present)) {
-  #   essa_all <- essa_all |>
-  #     mutate(across(all_of(grp_present), ~ readr::parse_number(.x)))
-  # }
-
-  # normalize key names and pivot long for ATSI support
   essa_all |>
-    rename_with(~ str_to_lower(.x)) |>
     rename(
-      schoolname = dplyr::any_of(c("schoolname", "school_name")),
-      districtname = dplyr::any_of(c("districtname", "district_name")),
-      countyname = dplyr::any_of(c("countyname", "county_name")),
-      reportingyear = dplyr::any_of(c(
-        "reportingyear",
-        "reporting_year",
-        "ReportingYear"
-      )),
-      csi_years = cs_iyears,
-      atsi_years = ats_iyears
+      csi_years = any_of(c("cs_iyears", "csi_years")),
+      atsi_years = any_of(c("ats_iyears", "atsi_years"))
     ) |>
-    mutate(reportingyear = parse_number(reportingyear)) |>
-    # Select the assistance status column that matches the reporting year
     mutate(
-      essa_status = case_when(
-        reportingyear == 2018 ~ assistance_status2018,
-        reportingyear == 2019 ~ assistance_status2019,
-        reportingyear == 2020 ~ assistance_status2020,
-        reportingyear == 2021 ~ assistance_status2021,
-        reportingyear == 2022 ~ assistance_status2022,
-        reportingyear == 2023 ~ assistance_status2023,
-        reportingyear == 2024 ~ assistance_status2024,
-        reportingyear == 2025 ~ assistance_status2025,
-        TRUE ~ NA_character_
-      ),
-      csi_years = if_else(
-        is.na(csi_years) | "N/A" == csi_years,
-        0,
-        parse_number(csi_years)
-      ),
-      atsi_years = if_else(
-        is.na(atsi_years) | "N/A" == atsi_years,
-        0,
-        parse_number(atsi_years)
-      ),
+      essa_status = coalesce(!!!syms(status_cols)),
+      # Silently convert "N/A" to NA, parse the number, and fill with 0
+      csi_years = coalesce(parse_number(na_if(csi_years, "N/A")), 0),
+      atsi_years = coalesce(parse_number(na_if(atsi_years, "N/A")), 0)
     ) |>
-    # Pivot student groups
     pivot_longer(
-      cols = intersect(names(essa_all), grp_cols),
-      names_to = "studentgroup",
+      cols = any_of(grp_cols),
+      names_to = "student_group",
       values_to = "atsi_support"
     ) |>
     mutate(
-      studentgroup = if_else(
-        studentgroup == "tom",
+      student_group = if_else(
+        student_group == "tom",
         "MR",
-        str_to_upper(studentgroup)
+        str_to_upper(student_group)
       )
     )
 }
 
-# compute_priority4_summary: from ca dashboard-with-assistance, compute priority 4 CAASPP/ELPI eligibility
-compute_priority4_summary <- function(df) {
-  filtered_df <-
-    df |>
-    filter(priority == 4, priority_eligible == TRUE)
+# --- CASE: TEACHER ASSIGNMENTS ---
+# Reduced to a single call since normalize_cde_names now handles bottom-up CDS construction
+normalize_teacher_assignments <- function(df) {
+  df |> normalize_cde_names()
+}
 
-  # debugging message: print number of rows after filtering and unique indicators
-  # message(
-  #   "Computing priority 4 summary: ",
-  #   nrow(filtered_df),
-  #   " rows after filtering. Columns: ",
-  #   paste(names(filtered_df), collapse = ", ")
-  # )
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS & LOOKUPS
+# ==============================================================================
+
+# compute_priority4_summary: computes priority 4 CAASPP/ELPI eligibility
+compute_priority4_summary <- function(df) {
+  filtered_df <- df |> filter(priority == 4, priority_eligible == TRUE)
 
   filtered_df |>
     mutate(
       color = dplyr::case_when(
-        reportingyear == 2022 ~ statuslevel,
-        reportingyear == 2024 & indicator == "science" ~ currstatus,
+        reporting_year == 2022 ~ statuslevel,
+        reporting_year == 2024 & indicator == "science" ~ currstatus,
         .default = color
       )
     ) |>
-    select(reportingyear, cds, student_group_long, indicator, color) |>
+    select(reporting_year, cds, student_group_long, indicator, color) |>
     pivot_wider(names_from = indicator, values_from = color) |>
     mutate(
       caaspp_eligible = (ELA %in% c(1, 2) & Math %in% c(1, 2)) &
@@ -351,7 +418,6 @@ compute_priority4_summary <- function(df) {
     )
 }
 
-# priority_eligibility_lookup: returns tibble mapping assistance -> allowed priorities
 priority_eligibility_lookup <- tibble::tribble(
   ~assistance , ~priorities   ,
   "A"         , c(4, 5, 6)    ,
@@ -367,28 +433,6 @@ priority_eligibility_lookup <- tibble::tribble(
   "K"         , c(4, 5, 6, 8)
 )
 
-# normalize teacher assignments data
-normalize_teacher_assignments <- function(df) {
-  df |>
-    janitor::clean_names() |>
-    # make cds code by concatenating county, district, and school codes with leading zeros
-    mutate(
-      cds = paste0(
-        coalesce(as.character(county_code), "00"),
-        coalesce(as.character(district_code), "00000"),
-        coalesce(as.character(school_code), "0000000")
-      )
-    ) |>
-    rename(
-      reportingyear = academic_year,
-      schoolname = school_name,
-      districtname = district_name,
-      countyname = county_name
-    )
-}
-
-# smart_title_case: intelligently capitalizes school and district names
-# Keeps acronyms (USD, COE) uppercase and small conjunctions lowercase
 smart_title_case <- function(text) {
   titled <- str_to_title(text)
 
@@ -434,22 +478,17 @@ smart_title_case <- function(text) {
     "mtss"
   )
 
-  for (word in lower_words) {
-    titled <- str_replace_all(
-      titled,
-      paste0("\\s", str_to_title(word), "\\s"),
-      paste0(" ", word, " ")
-    )
-  }
+  lower_replacements <- setNames(
+    paste0(" ", lower_words, " "),
+    paste0("\\s", str_to_title(lower_words), "\\s")
+  )
+  upper_replacements <- setNames(
+    toupper(upper_words),
+    paste0("\\b", str_to_title(upper_words), "\\b")
+  )
 
-  for (word in upper_words) {
-    titled <- str_replace_all(
-      titled,
-      paste0("\\b", str_to_title(word), "\\b"),
-      toupper(word)
-    )
-  }
-
-  # Fix possessive 's (str_to_title makes it 'S)
-  str_replace_all(titled, "'S\\b", "'s")
+  titled |>
+    str_replace_all(lower_replacements) |>
+    str_replace_all(upper_replacements) |>
+    str_replace_all("'S\\b", "'s")
 }
