@@ -99,12 +99,11 @@ caaspp_files <- tibble::tribble(
    2019 , "https://caaspp-elpac.ets.org/caaspp/researchfiles/sb_ca2019_all_csv_v4.zip" , "sb_ca2019_all_csv_v4.txt"
 )
 
-
 elpac_student_groups_url <- "https://caaspp-elpac.ets.org/elpac/researchfiles/StudentGroups.zip"
 
 # --- Census Day Enrollment Files ---
 census_files <- tibble::tribble(
-  ~year , ~url                                                                ,
+  ~year , ~url                                                              ,
    2025 , "https://www3.cde.ca.gov/demo-downloads/census/cdenroll2526.txt"    ,
    2024 , "https://www3.cde.ca.gov/demo-downloads/census/cdenroll2425.txt"    ,
    2023 , "https://www3.cde.ca.gov/demo-downloads/census/cdenroll2324-v2.txt"

@@ -43,8 +43,7 @@ attendance_data <- map_dfr(absent_urls, \(url) {
       startsWith(reporting_category, "S") ~ "Student Profiles",
       startsWith(reporting_category, "T") ~ "All Students"
     ),
-    demographic_name = case_match(
-      reporting_category,
+    demographic_name = reporting_category |> recode_values(
       "RB" ~ "African American",
       "RI" ~ "American Indian or Alaska Native",
       "RA" ~ "Asian",
@@ -66,6 +65,8 @@ attendance_data <- map_dfr(absent_urls, \(url) {
       "SH" ~ "Homeless",
       "GRK" ~ "Kindergarten",
       "GRKN" ~ "Kindergarten",
+      "GRTK8" ~ "Grades TK-8",
+      "GRTKKN" ~ "Grades TK-K",
       "GR13" ~ "Grades 1–3",
       "GR46" ~ "Grades 4–6",
       "GR78" ~ "Grades 7–8",

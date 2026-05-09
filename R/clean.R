@@ -32,7 +32,12 @@ normalize_cde_names <- function(df, data_term = "spring") {
       )),
       student_group = any_of(c("studentgroup", "student_group")),
       total_enrollment = any_of(c("totalenrollment", "total_enrollment")),
-      subgroup_total = any_of(c("subgrouptotal", "sub_group_total"))
+      subgroup_total = any_of(c("subgrouptotal", "sub_group_total")),
+      
+      # FIX: Standardize anomalous grade columns to ensure pivot_longer catches them
+      gr_ungr_elm = any_of(c("ungr_elm", "ungrelm", "ue")),
+      gr_ungr_sec = any_of(c("ungr_sec", "ungrsec", "us")),
+      gr_adult = any_of(c("adult", "ad"))
     )
 
   # --- CASE: YEAR FORMAT STANDARDIZATION ---

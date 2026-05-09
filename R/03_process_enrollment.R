@@ -6,7 +6,6 @@
 library(tidyverse)
 library(janitor)
 library(vroom)
-library(stringr)
 library(openxlsx)
 library(pins)
 library(here)
@@ -14,17 +13,25 @@ library(here)
 # 1. Establish robust project paths and load helpers
 source(here("R", "data-urls.R"))
 source(here("R", "load-files.R"))
-source(here("R", "clean.R"))
+source(here("R", "clean.R")) # Handles CDE normalizations, CDS building, and year formatting
 
 # 2. Connect to the local Pins board
 local_board <- board_folder(here("data", "pins"))
 
+# --- STANDARDIZED COLUMN ORDER ---
+standard_id_cols <- c(
+  "cds", "county_code", "district_code", "school_code",
+  "county_name", "district_name", "school_name",
+  "academic_year", "reporting_year", "aggregate_level", "rtype"
+)
+
 # Load SCOE School Directory (Provides the SCOE business rules for charters)
 scoe_schools <- pin_read(local_board, "solano_schools_directory") |>
-  select(school_code, scoe_reporting_district, scoe_reporting_school) |>
-  mutate(school_code = as.character(school_code))
+  select(county_code, district_code, school_code, scoe_reporting_district, scoe_reporting_school) |>
+  mutate(across(ends_with("_code"), as.character)) |>
+  distinct(county_code, district_code, school_code, .keep_all = TRUE) 
 
-# --- CANONICAL STUDENT GROUP MAPPING FOR CENSUS ---
+# --- CANONICAL STUDENT GROUP MAPPING FOR CENSUS & CUMULATIVE ---
 reporting_category_mapping <- c(
   "AR_03" = "Children 0 to 3 years old",
   "AR_0418" = "Students 4 to 18 years old",
@@ -35,7 +42,7 @@ reporting_category_mapping <- c(
   "AR_50P" = "Non-traditional adult students 50+ years old",
   "ELAS_ADEL" = "Adult English Learner",
   "ELAS_EL" = "English Learner",
-  "ELAS_EO" = "English Only Students", # Updated
+  "ELAS_EO" = "English Only Students",
   "ELAS_IFEP" = "Initial Fluent English Proficient",
   "ELAS_MISS" = "ELAS Missing",
   "ELAS_RFEP" = "Reclassified Fluent English Proficient",
@@ -45,13 +52,13 @@ reporting_category_mapping <- c(
   "GN_X" = "Non-Binary",
   "GN_Z" = "Gender Missing",
   "RE_A" = "Asian",
-  "RE_B" = "Black/African American", # Updated
-  "RE_D" = "Race/Ethnicity Not Reported", # Updated
+  "RE_B" = "Black/African American",
+  "RE_D" = "Race/Ethnicity Not Reported",
   "RE_F" = "Filipino",
-  "RE_H" = "Hispanic", # Updated
+  "RE_H" = "Hispanic",
   "RE_I" = "American Indian or Alaska Native",
   "RE_P" = "Pacific Islander",
-  "RE_T" = "Multiple Races/Two or more", # Updated
+  "RE_T" = "Multiple Races/Two or more",
   "RE_W" = "White",
   "SG_EL" = "English Learner",
   "SG_DS" = "Students with Disabilities",
@@ -59,21 +66,41 @@ reporting_category_mapping <- c(
   "SG_MG" = "Migrant Youth",
   "SG_FS" = "Foster Youth",
   "SG_HM" = "Homeless Youth",
-  "TA" = "All Students" # Updated
+  "TA" = "All Students"
 )
 
-# 2. Census Day Enrollment ---------------------------------------------------
+# 1. Create the lookup function
+reporting_category_lookup <- function(df) {
+  df |>
+    mutate(
+      reporting_group = case_when(
+        str_starts(reporting_category, "AR") ~ "Age Range",
+        str_starts(reporting_category, "ELAS") ~ "English Language Acquisition Status (ELAS)",
+        str_starts(reporting_category, "GN") ~ "Gender",
+        str_starts(reporting_category, "RE") ~ "Race/Ethnicity",
+        str_starts(reporting_category, "SG") ~ "Student Group",
+        str_starts(reporting_category, "TA") ~ "Total"
+      ),
+      student_group = recode_values(
+        reporting_category,
+        from = names(reporting_category_mapping),
+        to = unname(reporting_category_mapping),
+        default = reporting_category 
+      )
+    )
+}
+
+# ==============================================================================
+# 2. CENSUS DAY ENROLLMENT 
+# ==============================================================================
 message("Processing Census Day Enrollment...")
 
-# Process 2023 & 2024 Data (New CDE Format)
-census_new <- pmap_dfr(census_files, function(year, url) {
+census_raw <- pmap_dfr(census_files, function(year, url) {
   load_txt_from_cache(url) |>
     mutate(academic_year = as.character(year)) |>
-    normalize_cde_names(data_term = "fall") |> 
-    mutate(
-      student_group = reporting_category_mapping[reporting_category]
-    ) |>
-    filter(!is.na(student_group)) |>
+    normalize_cde_names(data_term = "fall") |>
+    reporting_category_lookup() |> 
+    rename(gr_13 = any_of(c("total_enr", "total_enrollment", "enrollment"))) |>
     pivot_longer(
       cols = starts_with("gr_"),
       names_to = "grade",
@@ -81,240 +108,213 @@ census_new <- pmap_dfr(census_files, function(year, url) {
       values_transform = as.numeric
     ) |>
     mutate(
-      grade = str_remove(grade, "gr_") |>
-        str_replace_all(c("tk" = "TK", "kn" = "K", "^0+" = ""))
+      grade = str_remove(grade, "^gr_"),
+      grade = case_when(
+        grade == "tk" ~ "TK",
+        grade == "kn" ~ "K",
+        .default = str_remove(grade, "^0+") 
+      )
     )
 })
 
-# Process 2017-2022 Data (Old CDE Multi-Year Format)
-census_older <- pmap_dfr(old_census_files, function(year_group, url) {
-  load_txt_from_cache(url) |>
-    normalize_cde_names(data_term = "fall") |>
-    mutate(
-      reporting_category = case_when(
-        !is.na(race_ethnicity) & race_ethnicity == 0 ~ "RE_D",
-        !is.na(race_ethnicity) & race_ethnicity == 1 ~ "RE_I",
-        !is.na(race_ethnicity) & race_ethnicity == 2 ~ "RE_A",
-        !is.na(race_ethnicity) & race_ethnicity == 3 ~ "RE_P",
-        !is.na(race_ethnicity) & race_ethnicity == 4 ~ "RE_F",
-        !is.na(race_ethnicity) & race_ethnicity == 5 ~ "RE_H",
-        !is.na(race_ethnicity) & race_ethnicity == 6 ~ "RE_B",
-        !is.na(race_ethnicity) & race_ethnicity == 7 ~ "RE_W",
-        !is.na(race_ethnicity) & race_ethnicity == 9 ~ "RE_T",
-        !is.na(gender) & gender == "F" ~ "GN_F",
-        !is.na(gender) & gender == "M" ~ "GN_M",
-        !is.na(gender) & gender == "X" ~ "GN_X",
-        !is.na(gender) & gender == "Z" ~ "GN_Z",
-        TRUE ~ NA_character_
-      ),
-      student_group = reporting_category_mapping[reporting_category]
-    ) |>
-    rename(
-      gr_01 = gr_1, gr_02 = gr_2, gr_03 = gr_3, gr_04 = gr_4,
-      gr_05 = gr_5, gr_06 = gr_6, gr_07 = gr_7, gr_08 = gr_8, gr_09 = gr_9
-    ) |>
-    pivot_longer(
-      cols = starts_with("gr_"),
-      names_to = "grade",
-      values_to = "enrollment"
-    ) |>
-    mutate(
-      grade = str_remove(grade, "gr_") |>
-        str_replace_all(c("kn" = "K", "^0+" = ""))
-    ) |>
-    filter(enr_type == "C", !is.na(student_group)) |>
-    mutate(enrollment = as.numeric(enrollment))
-})
+cde_official_lookup <- census_raw |>
+  filter(county_name == "Solano") |>
+  # Keep only the total 'ALL' rollup for districts, or allow all for actual schools
+  filter(is.na(charter) | toupper(charter) == "ALL" | school_code != "0000000") |>
+  select(cds, academic_year, reporting_group, student_group, grade, cde_aggregate = enrollment) |>
+  # Group by instead of distinct to catch any remaining duplicates gracefully
+  group_by(cds, academic_year, reporting_group, student_group, grade) |>
+  summarise(cde_aggregate = sum(cde_aggregate, na.rm = TRUE), .groups = "drop")
 
-# Combine, Filter, Apply SCOE Rules
-census_enrollment <- bind_rows(census_new, census_older) |>
-  filter(county_name == "Solano", enrollment > 0) |> 
-  left_join(scoe_schools, by = "school_code") |>
+census_schools <- census_raw |>
+  filter(county_name == "Solano", !is.na(enrollment), school_code != "0000000", school_name != "Nonpublic, Nonsectarian Schools") |> 
+  left_join(scoe_schools, by = join_by("county_code", "district_code", "school_code")) |>
   mutate(
     district_name = coalesce(scoe_reporting_district, district_name),
     school_name = coalesce(scoe_reporting_school, school_name),
-    academic_year = factor(academic_year, levels = as.character(2017:2024)),
-    student_group = factor(student_group)
+    academic_year = factor(academic_year),
+    student_group = factor(student_group),
+    aggregate_level = "S" 
   ) |>
-  select(
-    county_code, county_name, district_code, district_name,
-    school_code, school_name, academic_year, reporting_year,
-    student_group, grade, enrollment
-  )
+  select(cds, aggregate_level, county_code, county_name, district_code, district_name, school_code, school_name, academic_year, reporting_year, reporting_group, student_group, grade, enrollment)
 
-# Calculate totals and append
-census_totals <- census_enrollment |>
-  group_by(
-    county_code, county_name, district_code, district_name,
-    school_code, school_name, academic_year, reporting_year,
-    student_group
-  ) |>
+# Creating entirely new District and County aggregates safely
+census_districts <- census_schools |>
+  group_by(county_code, county_name, district_code, district_name, academic_year, reporting_year, reporting_group, student_group, grade) |>
   summarise(enrollment = sum(enrollment, na.rm = TRUE), .groups = "drop") |>
-  mutate(grade = "13") # 13 signifies Total
+  mutate(school_code = "0000000", school_name = "District Aggregate", cds = paste0(county_code, district_code, "0000000"), aggregate_level = "D")
 
-census_enrollment <- bind_rows(census_enrollment, census_totals) |> distinct()
+census_county <- census_districts |>
+  group_by(county_code, county_name, academic_year, reporting_year, reporting_group, student_group, grade) |>
+  summarise(enrollment = sum(enrollment, na.rm = TRUE), .groups = "drop") |>
+  mutate(district_code = "00000", district_name = "Solano County Aggregate", school_code = "0000000", school_name = "County Aggregate", cds = paste0(county_code, "000000000000"), aggregate_level = "C")
 
-pin_write(
-  local_board,
-  census_enrollment,
-  "solano_census_enrollment",
-  type = "parquet",
-  description = "Longitudinal Census Day Enrollment with SCOE charter rules applied"
-)
+census_enrollment_final <- bind_rows(census_schools, census_districts, census_county) |> 
+  distinct() |>
+  left_join(cde_official_lookup, by = c("cds", "academic_year", "reporting_group", "student_group", "grade")) |>
+  mutate(cde_aggregate = coalesce(cde_aggregate, enrollment)) |>
+  select(any_of(standard_id_cols), everything())
 
-# 3. Cumulative Enrollment ---------------------------------------------------
+pin_write(local_board, census_enrollment_final, "solano_census_enrollment", type = "parquet", description = "Longitudinal Census Enrollment with SCOE LEA aggregations, NPS excluded, and official CDE aggregates maintained.")
+
+# ==============================================================================
+# 3. CUMULATIVE ENROLLMENT
+# ==============================================================================
 message("Processing Cumulative Enrollment...")
 
-cumulative_enrollment <- pmap_dfr(cumulative_files, function(year, url) {
+cum_raw <- pmap_dfr(cumulative_files, function(year, url) {
   load_txt_from_cache(url) |>
-    mutate(academic_year = as.character(year)) |>
-    normalize_cde_names()
-}) |>
-  filter(county_code == "48") |>
-  mutate(
-    student_group = case_match(
-      reporting_category,
-      "RB" ~ "Black/African American",
-      "RI" ~ "American Indian or Alaska Native",
-      "RA" ~ "Asian",
-      "RF" ~ "Filipino",
-      "RH" ~ "Hispanic",
-      "RD" ~ "Race/Ethnicity Not Reported",
-      "RP" ~ "Pacific Islander",
-      "RT" ~ "Multiple Races/Two or more",
-      "RW" ~ "White",
-      "GM" ~ "Male",
-      "GF" ~ "Female",
-      "GX" ~ "Non-Binary",
-      "GZ" ~ "Gender Missing",
-      "SE" ~ "English Learner",
-      "SD" ~ "Students with Disabilities",
-      "SS" ~ "Socioeconomically Disadvantaged",
-      "SM" ~ "Migrant Youth",
-      "SF" ~ "Foster Youth",
-      "SH" ~ "Homeless Youth",
-      "TA" ~ "All Students"
-    )
+    mutate(reporting_year = year) |>
+    normalize_cde_names(data_term = "spring") |> 
+    reporting_category_lookup() |>
+    rename(cumulative_enrollment = any_of(c("cumulative_enrollment", "total_enrollment", "enrollment"))) |>
+    mutate(cumulative_enrollment = suppressWarnings(as.numeric(cumulative_enrollment)))
+})
+
+cum_cde_official <- cum_raw |>
+  filter(county_name == "Solano") |>
+  filter(is.na(charter) | toupper(charter) == "ALL" | school_code != "0000000") |>
+  select(cds, academic_year, reporting_group, student_group, cde_aggregate = cumulative_enrollment) |>
+  group_by(cds, academic_year, reporting_group, student_group) |>
+  summarise(cde_aggregate = sum(cde_aggregate, na.rm = TRUE), .groups = "drop")
+
+cum_schools <- cum_raw |>
+  filter(
+    county_name == "Solano", 
+    !is.na(cumulative_enrollment), 
+    school_code != "0000000", 
+    school_name != "Nonpublic, Nonsectarian Schools"
   ) |>
-  left_join(scoe_schools, by = "school_code") |>
+  left_join(scoe_schools, by = join_by("county_code", "district_code", "school_code")) |>
   mutate(
     district_name = coalesce(scoe_reporting_district, district_name),
-    school_name = coalesce(scoe_reporting_school, school_name)
-  )
+    school_name = coalesce(scoe_reporting_school, school_name),
+    academic_year = factor(academic_year),
+    student_group = factor(student_group),
+    aggregate_level = "S" 
+  ) |>
+  select(cds, aggregate_level, county_code, county_name, district_code, district_name, school_code, school_name, academic_year, reporting_year, reporting_group, student_group, cumulative_enrollment)
 
-pin_write(
-  local_board,
-  cumulative_enrollment,
-  "solano_cumulative_enrollment",
-  type = "parquet",
-  description = "Longitudinal Cumulative Enrollment with SCOE charter rules applied"
-)
+cum_districts <- cum_schools |>
+  group_by(county_code, county_name, district_code, district_name, academic_year, reporting_year, reporting_group, student_group) |>
+  summarise(cumulative_enrollment = sum(cumulative_enrollment, na.rm = TRUE), .groups = "drop") |>
+  mutate(school_code = "0000000", school_name = "District Aggregate", cds = paste0(county_code, district_code, "0000000"), aggregate_level = "D")
 
-# 4. Dashboard Enrollment ----------------------------------------------------
+cum_county <- cum_districts |>
+  group_by(county_code, county_name, academic_year, reporting_year, reporting_group, student_group) |>
+  summarise(cumulative_enrollment = sum(cumulative_enrollment, na.rm = TRUE), .groups = "drop") |>
+  mutate(district_code = "00000", district_name = "Solano County Aggregate", school_code = "0000000", school_name = "County Aggregate", cds = paste0(county_code, "000000000000"), aggregate_level = "C")
+
+cum_enrollment_final <- bind_rows(cum_schools, cum_districts, cum_county) |> 
+  distinct() |>
+  left_join(cum_cde_official, by = c("cds", "academic_year", "reporting_group", "student_group")) |>
+  mutate(cde_aggregate = coalesce(cde_aggregate, cumulative_enrollment)) |>
+  select(any_of(standard_id_cols), everything())
+
+pin_write(local_board, cum_enrollment_final, "solano_cumulative_enrollment", type = "parquet", description = "Longitudinal Cumulative Enrollment with SCOE aggregations.")
+
+# ==============================================================================
+# 4. DASHBOARD ENROLLMENT
+# ==============================================================================
 message("Processing Dashboard Enrollment...")
 
-dash_enrollment <- pmap_dfr(dash_files, function(year, url) {
+# 1. Load the raw data and standardize names/levels
+dash_raw <- pmap_dfr(dash_files, function(year, url) {
   load_txt_from_cache(url) |>
     normalize_cde_names() |>
-    # FIX: Ensure reporting_year is populated AFTER normalization to prevent duplicate columns
     mutate(reporting_year = coalesce(reporting_year, as.numeric(year)))
 }) |>
+  # rename(aggregate_level = any_of(c("rtype", "r_type"))) |> 
   filter(county_name == "Solano") |>
   mutate(
-    student_group = case_match(
-      student_group,
-      "ALL" ~ "All Students",
-      "AA" ~ "Black/African American",
-      "AI" ~ "American Indian or Alaska Native",
-      "AS" ~ "Asian",
-      "FI" ~ "Filipino",
-      "HI" ~ "Hispanic",
-      "PI" ~ "Pacific Islander",
-      "WH" ~ "White",
-      "MR" ~ "Multiple Races/Two or more",
-      "EL" ~ "English Learner",
-      "ELO" ~ "English Learners Only",
-      "RFP" ~ "RFEPs Only",
-      "EO" ~ "English Only Students",
-      "SBA" ~ "Smarter Balanced Assessment",
-      "CAA" ~ "CA Alternative Assessment",
-      "SED" ~ "Socioeconomically Disadvantaged",
-      "SWD" ~ "Students with Disabilities",
-      "FOS" ~ "Foster Youth",
-      "HOM" ~ "Homeless Youth"
-    ),
     county_name = if_else(rtype == "X", "CA State Aggregate", county_name),
     district_name = if_else(rtype == "X", "State of California", district_name),
-    school_name = if_else(
-      rtype == "D" & (is.na(school_name) | school_name == "CHECK"),
-      "District Aggregate",
-      school_name
+    school_name = if_else(rtype == "D" & (is.na(school_name) | school_name == "No Data"), "District Aggregate", school_name)
+  )
+
+# 2. Map the actual demographic subgroups
+dash_subgroups <- dash_raw |>
+  mutate(
+    student_group = case_match(
+      toupper(str_trim(student_group)),
+      "AA" ~ "Black/African American", 
+      "AI" ~ "American Indian or Alaska Native",
+      "AS" ~ "Asian", 
+      "FI" ~ "Filipino", 
+      "HI" ~ "Hispanic", 
+      "PI" ~ "Pacific Islander", 
+      "WH" ~ "White",
+      "MR" ~ "Multiple Races/Two or more", 
+      "EL" ~ "English Learner", 
+      "ELO" ~ "English Learners Only",
+      "RFP" ~ "RFEPs Only", 
+      "EO" ~ "English Only Students", 
+      "SBA" ~ "Smarter Balanced Assessment",
+      "CAA" ~ "CA Alternative Assessment", 
+      "SED" ~ "Socioeconomically Disadvantaged",
+      "SWD" ~ "Students with Disabilities", 
+      "FOS" ~ "Foster Youth", 
+      "HOM" ~ "Homeless Youth",
+      .default = student_group 
     )
-  ) |>
-  left_join(scoe_schools, by = "school_code") |>
+  )
+
+# 3. Construct the missing "All Students" group using total_enrollment
+dash_all_students <- dash_subgroups |>
+  distinct(cds, academic_year, reporting_year, .keep_all = TRUE) |>
+  mutate(
+    student_group = "All Students",
+    subgroup_total = total_enrollment,
+    rate = 100 # All Students mathematically represent 100% of the school's enrollment
+  )
+
+# 4. Bind them together and apply SCOE mappings
+dash_enrollment <- bind_rows(dash_all_students, dash_subgroups) |>
+  left_join(scoe_schools, by = join_by("county_code", "district_code", "school_code")) |>
   mutate(
     district_name = coalesce(scoe_reporting_district, district_name),
     school_name = coalesce(scoe_reporting_school, school_name)
-  )
+  ) |>
+  select(any_of(standard_id_cols), everything())
 
-pin_write(
-  local_board,
-  dash_enrollment,
-  "solano_dash_enrollment",
-  type = "parquet",
-  description = "Longitudinal Dashboard Enrollment with SCOE charter rules applied"
-)
+pin_write(local_board, dash_enrollment, "solano_dash_enrollment", type = "parquet", description = "Longitudinal Dashboard Enrollment with SCOE charter rules applied")
 
-# 5. Unduplicated Pupil Count (UPC) ------------------------------------------
+# ==============================================================================
+# 5. UNDUPLICATED PUPIL COUNT (UPC)
+# ==============================================================================
 message("Processing UPC Data...")
 
 upc_enrollment <- pmap_dfr(upc_files, function(year, url, sheet, start_row) {
   load_excel_from_cache(url, sheet = sheet, start_row = start_row) |>
     mutate(academic_year = year) |>
     normalize_cde_names(data_term = "fall") |>
-    rename(
-      free_reduced_meal_program = any_of(c(
-        "free_reduced_price_meals",
-        "free_reduced_meal_program"
-      ))
-    )
+    rename(free_reduced_meal_program = any_of(c("free_reduced_price_meals", "free_reduced_meal_program")))
 }) |>
   filter(county_name == "Solano") |>
   mutate(
-    school_name = if_else(
-      is.na(school_name) | school_name == "N/A",
-      "District Aggregate",
-      school_name
+    school_name = if_else(is.na(school_name) | school_name == "N/A", "District Aggregate", school_name),
+    aggregate_level = case_when(
+      district_code == "00000" ~ "C",
+      school_code == "0000000" ~ "D",
+      .default = "S"
     )
   ) |>
-  left_join(scoe_schools, by = "school_code") |>
+  left_join(scoe_schools, by = join_by("county_code", "district_code", "school_code")) |>
   mutate(
     district_name = coalesce(scoe_reporting_district, district_name),
     school_name = coalesce(scoe_reporting_school, school_name)
   ) |>
   pivot_longer(
     cols = any_of(c(
-      "total_enrollment",
-      "free_reduced_meal_program",
-      "foster",
-      "tribal_foster_youth",
-      "homeless",
-      "migrant_program",
-      "direct_certification",
-      "unduplicated_frpm_eligible_count",
-      "english_learner",
-      "calpads_unduplicated_pupil_count_upc"
+      "total_enrollment", "free_reduced_meal_program", "foster", "tribal_foster_youth",
+      "homeless", "migrant_program", "direct_certification", "unduplicated_frpm_eligible_count",
+      "english_learner", "calpads_unduplicated_pupil_count_upc"
     )),
     names_to = "program",
     values_to = "student_count"
-  )
+  ) |>
+  select(any_of(standard_id_cols), everything())
 
-pin_write(
-  local_board,
-  upc_enrollment,
-  "solano_upc_enrollment",
-  type = "parquet",
-  description = "Longitudinal UPC Enrollment with SCOE charter rules applied"
-)
+pin_write(local_board, upc_enrollment, "solano_upc_enrollment", type = "parquet", description = "Longitudinal UPC Enrollment with SCOE charter rules applied")
 
 message("All enrollment processing complete!")

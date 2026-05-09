@@ -77,7 +77,7 @@ raw_essa_list <- pmap(essa_files, function(name, url, sheet, start_row) {
   df |>
     mutate(across(
       .cols = all_of(existing_numeric_cols),
-      .fns = ~ suppressWarnings(as.numeric(.x))
+      .fns = ~ as.numeric(na_if(.x, "*"))
     ))
 }) |>
   set_names(essa_files$name)
